@@ -29,8 +29,10 @@ TRACE_ID_BYTES = 16
 class Trace(object):
     '''Object encapsulating all state of an ongoing trace.'''
 
-    def __init__(self, trace_id, dataset=None):
+    def __init__(self, trace_id, dataset=None, enabled=True, trace_sample_rate=1):
         self.id = trace_id
+        self.enabled = enabled
+        self.trace_sample_rate = trace_sample_rate
         self.dataset = dataset
         self.stack = []
         self.fields = {}
@@ -38,7 +40,9 @@ class Trace(object):
 
     def copy(self):
         '''Copy the trace state for use in another thread or context.'''
-        result = Trace(self.id)
+        result = Trace(
+            self.id, enabled=self.enabled, trace_sample_rate=self.trace_sample_rate
+        )
         result.stack = copy.copy(self.stack)
         result.fields = copy.copy(self.fields)
         return result
@@ -50,25 +54,25 @@ class Tracer(object):
 
         self.presend_hook = None
         self.sampler_hook = None
-        self.http_trace_parser_hook = beeline.propagation.default.http_trace_parser_hook
-        self.http_trace_propagation_hook = beeline.propagation.default.http_trace_propagation_hook
+        self.trace_sampler_hook = None
+        self.http_trace_parser_hook = beeline.propagation.honeycomb.http_trace_parser_hook
+        self.http_trace_propagation_hook = beeline.propagation.honeycomb.http_trace_propagation_hook
 
     @contextmanager
     def __call__(self, name, trace_id=None, parent_id=None):
+        should_start_trace = trace_id or not self.get_active_trace_id()
+        span = None
         try:
-            span = None
-            if self.get_active_trace_id() and trace_id is None:
-                span = self.start_span(
-                    context={'name': name}, parent_id=parent_id)
-                if span:
-                    log('tracer context manager started new span, id = %s',
-                        span.id)
-            else:
+            if should_start_trace:
                 span = self.start_trace(
                     context={'name': name}, trace_id=trace_id, parent_span_id=parent_id)
                 if span:
                     log('tracer context manager started new trace, id = %s',
                         span.trace_id)
+            else:
+                span = self.start_span(context={'name': name}, parent_id=parent_id)
+                if span:
+                    log('tracer context manager started new span, id = %s', span.id)
             yield span
         except Exception as e:
             if span:
@@ -79,26 +83,31 @@ class Tracer(object):
                 })
             raise
         finally:
-            if span:
-                if span.is_root():
-                    log('tracer context manager ending trace, id = %s',
-                        span.trace_id)
-                    self.finish_trace(span)
-                else:
-                    log('tracer context manager ending span, id = %s',
-                        span.id)
-                    self.finish_span(span)
-            else:
-                log('tracer context manager span for %s was unexpectedly None', name)
+            if should_start_trace:
+                if span:
+                    log("tracer context manager ending trace, id = %s", span.trace_id)
+                self.finish_trace(span)
+            elif span:
+                log("tracer context manager ending span, id = %s", span.id)
+                self.finish_span(span)
 
     def start_trace(self, context=None, trace_id=None, parent_span_id=None, dataset=None):
         if trace_id:
             if self._trace:
                 log('warning: start_trace got explicit trace_id but we are already in a trace. '
                     'starting new trace with id = %s', trace_id)
-            self._trace = Trace(trace_id, dataset)
         else:
-            self._trace = Trace(generate_trace_id(), dataset)
+            trace_id = generate_trace_id()
+
+        if self.trace_sampler_hook:
+            enabled, trace_sample_rate = self.trace_sampler_hook(trace_id, context)
+        else:
+            enabled = True
+            trace_sample_rate = 1
+
+        self._trace = Trace(
+            trace_id, dataset, enabled=enabled, trace_sample_rate=trace_sample_rate
+        )
 
         # start the root span
         return self.start_span(context=context, parent_id=parent_span_id, is_root_span=True)
@@ -106,6 +115,10 @@ class Tracer(object):
     def start_span(self, context=None, parent_id=None, is_root_span=False):
         if not self._trace:
             log('start_span called but no trace is active')
+            return None
+        if not self._trace.enabled:
+            # If the trace has been disabled due to trace sampler hook,
+            # avoid doing any work at all.
             return None
 
         span_id = generate_span_id()
@@ -117,18 +130,14 @@ class Tracer(object):
         if context:
             ev.add(data=context)
 
-        fields = {
+        data = {
             'trace.trace_id': self._trace.id,
             'trace.parent_id': parent_span_id,
             'trace.span_id': span_id,
         }
-        if is_root_span:
-            spanType = "root"
-            if parent_span_id:
-                spanType = "subroot"
-            fields['meta.span_type'] = spanType
-        ev.add(data=fields)
-
+        if self._trace.trace_sample_rate > 1:
+            data['trace.trace_sample_rate'] = self._trace.trace_sample_rate
+        ev.add(data=data)
         is_root = len(self._trace.stack) == 0
         span = Span(trace_id=self._trace.id, parent_id=parent_span_id,
                     id=span_id, event=ev, is_root=is_root)
@@ -304,9 +313,11 @@ class Tracer(object):
             self._trace.fields
         )
 
-    def register_hooks(self, presend=None, sampler=None, http_trace_parser=None, http_trace_propagation=None):
+    def register_hooks(self, presend=None, sampler=None, trace_sampler=None,
+                       http_trace_parser=None, http_trace_propagation=None):
         self.presend_hook = presend
         self.sampler_hook = sampler
+        self.trace_sampler_hook = trace_sampler
         self.http_trace_parser_hook = http_trace_parser
         self.http_trace_propagation_hook = http_trace_propagation
 
@@ -317,22 +328,32 @@ class Tracer(object):
         used here. Pass them to the tracer implementation?
         '''
         presampled = False
+        ev_fields = span.event.fields()
+
+        try:
+            trace_sample_rate = int(ev_fields.pop('trace.trace_sample_rate', 1))
+        except Exception:
+            trace_sample_rate = 1
+
+        if trace_sample_rate > 1:
+            span.event.sample_rate = trace_sample_rate
+            presampled = True
+
         if self.sampler_hook:
-            log("executing sampler hook on event ev = %s", span.event.fields())
-            keep, new_rate = self.sampler_hook(span.event.fields())
+            log("executing sampler hook on event ev = %s", ev_fields)
+            keep, new_rate = self.sampler_hook(ev_fields)
             if not keep:
-                log("skipping event due to sampler hook sampling ev = %s",
-                    span.event.fields())
+                log("skipping event due to sampler hook sampling ev = %s", ev_fields)
                 return
-            span.event.sample_rate = new_rate
+            span.event.sample_rate = new_rate * trace_sample_rate
             presampled = True
 
         if self.presend_hook:
-            log("executing presend hook on event ev = %s", span.event.fields())
-            self.presend_hook(span.event.fields())
+            log("executing presend hook on event ev = %s", ev_fields)
+            self.presend_hook(ev_fields)
 
         if presampled:
-            log("enqueuing presampled event ev = %s", span.event.fields())
+            log("enqueuing presampled event ev = %s", ev_fields)
             span.event.send_presampled()
         elif _should_sample(span.trace_id, span.event.sample_rate):
             # if our sampler hook wasn't used, use deterministic sampling
