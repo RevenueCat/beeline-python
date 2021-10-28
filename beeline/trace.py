@@ -426,17 +426,11 @@ def traced_impl(tracer_fn, name, trace_id, parent_id):
     return wrapped
 
 
-# Use system random instead of default psuedorandom generator
-system_random = random.SystemRandom()
-
-
 def generate_span_id():
     """Generate span ID compatible with w3c tracing spec."""
-    format_str = "{{:0{:d}x}}".format(SPAN_ID_BYTES*2)
-    return format_str.format(system_random.getrandbits(SPAN_ID_BYTES*8))
+    return random.getrandbits(SPAN_ID_BYTES * 8).to_bytes(SPAN_ID_BYTES, "big").hex()
 
 
 def generate_trace_id():
     """Generate trace ID compatible with w3c tracing spec."""
-    format_str = "{{:0{:d}x}}".format(TRACE_ID_BYTES*2)
-    return format_str.format(system_random.getrandbits(TRACE_ID_BYTES*8))
+    return random.getrandbits(TRACE_ID_BYTES * 8).to_bytes(TRACE_ID_BYTES, "big").hex()
