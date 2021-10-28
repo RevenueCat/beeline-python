@@ -58,7 +58,7 @@ class Beeline(object):
                  tracer=None, sample_rate=1, api_host='https://api.honeycomb.io',
                  max_concurrent_batches=10, max_batch_size=100, send_frequency=0.25,
                  block_on_send=False, block_on_response=False,
-                 transmission_impl=None, sampler_hook=None, presend_hook=None,
+                 transmission_impl=None, sampler_hook=None, trace_sampler_hook=None, presend_hook=None,
                  http_trace_parser_hook=beeline.propagation.honeycomb.http_trace_parser_hook,
                  http_trace_propagation_hook=beeline.propagation.honeycomb.http_trace_propagation_hook,
                  debug=False):
@@ -67,6 +67,7 @@ class Beeline(object):
         self.tracer_impl = None
         self.presend_hook = None
         self.sampler_hook = None
+        self.trace_sampler_hook = None
         self.http_trace_parser_hook = None
         self.http_trace_propagation_hook = None
 
@@ -114,9 +115,11 @@ class Beeline(object):
         self.tracer_impl.register_hooks(
             presend=presend_hook,
             sampler=sampler_hook,
+            trace_sampler=trace_sampler_hook,
             http_trace_parser=http_trace_parser_hook,
             http_trace_propagation=http_trace_propagation_hook)
         self.sampler_hook = sampler_hook
+        self.trace_sampler_hook = trace_sampler_hook
         self.presend_hook = presend_hook
         self.http_trace_parser_hook = http_trace_parser_hook
         self.http_trace_propagation_hook = http_trace_propagation_hook
@@ -233,25 +236,36 @@ class Beeline(object):
     def _run_hooks_and_send(self, ev):
         ''' internal - run any defined hooks on the event and send '''
         presampled = False
+        ev_fields = ev.fields()
+
+        try:
+            trace_sample_rate = int(ev_fields.pop("trace.trace_sample_rate", 1))
+        except Exception:
+            trace_sample_rate = 1
+
+        if trace_sample_rate > 1:
+            ev.sample_rate = trace_sample_rate
+            presampled = True
+
         if self.sampler_hook:
-            self.log("executing sampler hook on event ev = %s", ev.fields())
-            keep, new_rate = self.sampler_hook(ev.fields())
+            self.log("executing sampler hook on event ev = %s", ev_fields)
+            keep, new_rate = self.sampler_hook(ev_fields)
             if not keep:
                 self.log(
-                    "skipping event due to sampler hook sampling ev = %s", ev.fields())
+                    "skipping event due to sampler hook sampling ev = %s", ev_fields)
                 return
-            ev.sample_rate = new_rate
+            ev.sample_rate = new_rate * trace_sample_rate
             presampled = True
 
         if self.presend_hook:
-            self.log("executing presend hook on event ev = %s", ev.fields())
-            self.presend_hook(ev.fields())
+            self.log("executing presend hook on event ev = %s", ev_fields)
+            self.presend_hook(ev_fields)
 
         if presampled:
-            self.log("enqueuing presampled event ev = %s", ev.fields())
+            self.log("enqueuing presampled event ev = %s", ev_fields)
             ev.send_presampled()
         else:
-            self.log("enqueuing event ev = %s", ev.fields())
+            self.log("enqueuing event ev = %s", ev_fields)
             ev.send()
 
     def _init_logger(self):
@@ -278,7 +292,8 @@ class Beeline(object):
 
 def init(writekey='', dataset='', service_name='', tracer=None,
          sample_rate=1, api_host='https://api.honeycomb.io', transmission_impl=None,
-         sampler_hook=None, presend_hook=None, debug=False, *args, **kwargs):
+         sampler_hook=None, trace_sampler_hook=None, presend_hook=None, debug=False,
+         *args, **kwargs):
     ''' initialize the honeycomb beeline. This will initialize a libhoney
     client local to this module, and a tracer to track traces and spans.
 
@@ -293,6 +308,16 @@ def init(writekey='', dataset='', service_name='', tracer=None,
             The function should accept a dictionary of event fields, and return a tuple
             of type (bool, int). The first item indicates whether or not the event
             should be sent, and the second indicates the updated sample rate to use.
+    - `trace_sampler_hook`: accepts a function to be called before capturing events
+            in a trace.
+            The function should accept a trace id and trace context, and return a
+            tuple of type (bool, int)
+            The first item indicates whether a trace should be captured or not, and the
+            second indicates the updated sample rate to use.
+            If a trace is determined to not be captured, no events or further spans
+            will be logged during the request. Beeline calls will be almost a no-op
+            in terms of performance. This is usefull if you want to avoid spending
+            resources capturing events.
     - `presend_hook`: accepts a function to be called just before each event is sent.
             The functon should accept a dictionary of event fields, and can be used
             to add new fields, modify/scrub existing fields, or drop fields. This
@@ -315,7 +340,7 @@ def init(writekey='', dataset='', service_name='', tracer=None,
         writekey=writekey, dataset=dataset, sample_rate=sample_rate,
         api_host=api_host, transmission_impl=transmission_impl,
         debug=debug, presend_hook=presend_hook, sampler_hook=sampler_hook,
-        service_name=service_name,
+        trace_sampler_hook=trace_sampler_hook, service_name=service_name,
         # since we've simplified the init function signature a bit,
         # pass on other args for backwards compatibility
         *args, **kwargs
