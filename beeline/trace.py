@@ -137,6 +137,8 @@ class Tracer(object):
         }
         if self._trace.trace_sample_rate > 1:
             data['trace.trace_sample_rate'] = self._trace.trace_sample_rate
+        if is_root_span:
+            data['meta.span_type'] = "root" if not parent_span_id else "subroot"
         ev.add(data=data)
         is_root = len(self._trace.stack) == 0
         span = Span(trace_id=self._trace.id, parent_id=parent_span_id,
